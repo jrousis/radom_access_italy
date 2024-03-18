@@ -5,13 +5,14 @@
     Created:	23/2/2024 9:12:03 μμ
     Author:     ROUSISHOME\User
 */
-
+#include <esp32fota.h>
 #include <WiFi.h>
 #include <DNSServer.h>
 #include <ESPUI.h>
 #include <EEPROM.h>
 
 #define OPEN_HOT_SPOT 39
+#define IN_BUTTON 36
 
 #define EEP_WIFI_SSID 0
 #define EEP_WIFI_PASS 32
@@ -20,16 +21,21 @@
 #define EEP_SENSOR 196
 #define EEP_DEFAULT_LOGIN 197
 #define EEP_DEFAULT_WiFi 198
+#define EEP_PERCENT_SELLECT 199
+#define EEP_DURATION_SELLECT 200
 
-const int buttonPin = 36;
 const int buttonPin2 = 39;
 const int ledPin =  13;
 const int out1Pin =  15;
 const int out2Pin =  2;
-int buttonState = 0;
 //==================================================================================
 // GUI settings 
-const char* soft_ID = "Rousis Systems LTD\nWeb_LED_Clock_V2.2";
+const String soft_version = "1.0.4";
+const String soft_name = "Rousis Systems LTD - Random_Access Ver.: ";
+//convert the soft name + soft_version to const char* soft_ID
+//const char* soft_ID = (soft_name + soft_version + 0).c_str();
+const char* soft_ID = "Rousis Systems LTD\nRandom_Access V.1.0.4";
+
 //----------------------------------------------------------------------------------
 const byte DNS_PORT = 53;
 IPAddress apIP(192, 168, 4, 1);
@@ -38,6 +44,23 @@ DNSServer dnsServer;
 const char* ssid = "rousis";
 const char* password = "rousis074520198";
 const char* hostname = "espui";
+
+uint8_t pass_count = 0;
+uint8_t percent = 5;
+uint8_t duration = 10;
+uint8_t rundom_numpers[15] = { 0 };
+long total_pass = 0;
+uint16_t total_open = 0;
+long led_timeout = 0;
+
+//SSet the button to be active low
+//#include <JC_Button.h>              // https://github.com/JChristensen/JC_Button
+// pin assignments
+   // define the buttons
+
+//==================================================================================
+// GUI settings
+uint16_t percent_select, duration_select;
 
 uint16_t password_text, user_text;
 uint16_t wifi_ssid_text, wifi_pass_text;
@@ -144,6 +167,20 @@ void generalCallback(Control* sender, int type) {
     Serial.print(sender->label);
     Serial.print("' = ");
     Serial.println(sender->value);
+    
+    if (sender->label == "Percent %")
+    {
+        percent = sender->value.toInt();
+		EEPROM.write(EEP_PERCENT_SELLECT, percent);
+		EEPROM.commit();
+	}
+	else if (sender->label == "Duration Out")
+	{
+		duration = sender->value.toInt();
+		EEPROM.write(EEP_DURATION_SELLECT, duration);
+		EEPROM.commit();
+    }
+    
 }
 
 void ReadWiFiCrententials(void) {
@@ -183,20 +220,24 @@ void Readuserdetails(void) {
     readStringFromEEPROM(stored_password, 160, 32);*/
 }
 
+esp32FOTA esp32FOTA("esp32-fota-http", soft_version, false);
+const char* manifest_url = "http://smart-q.eu/fota/radom_access_italy.json";
+
 void setup()
 {
     EEPROM.begin(255);
     Serial.begin(115200);
     pinMode(OPEN_HOT_SPOT, INPUT_PULLUP);
-	pinMode(buttonPin, INPUT_PULLUP);
-    pinMode(buttonPin2, INPUT_PULLUP);
+    pinMode(IN_BUTTON, INPUT_PULLUP);
     pinMode(ledPin, OUTPUT);
     pinMode(out1Pin, OUTPUT);
 	pinMode(out2Pin, OUTPUT);
 
-
     delay(100);
     Serial.println("Start..");
+
+    esp32FOTA.setManifestURL(manifest_url);
+    esp32FOTA.printConfig();
 
     //-----------------------------------------------------------------------
   // GUI interface setup
@@ -264,6 +305,26 @@ void setup()
     uint16_t tab2 = ESPUI.addControl(ControlType::Tab, "User Settings", "User");
     uint16_t tab3 = ESPUI.addControl(ControlType::Tab, "WiFi Settings", "WiFi");
 
+    percent = EEPROM.read(EEP_PERCENT_SELLECT);
+    duration = EEPROM.read(EEP_DURATION_SELLECT);
+
+    if (percent > 15)
+        percent = 15;
+    if (percent < 2)
+        percent = 2;
+    percent_select = ESPUI.addControl(Number, "Percent %", String(percent), Peterriver, tab1, generalCallback);
+    ESPUI.addControl(Min, "", "2", None, percent_select);
+    ESPUI.addControl(Max, "", "15", None, percent_select);
+
+    if (duration > 50)
+		duration = 50;
+    if (duration < 5)
+        duration = 5;
+    duration_select = ESPUI.addControl(Number, "Duration Out", String(duration), Peterriver, tab1, generalCallback);
+    
+    ESPUI.addControl(Min, "", "5", None, duration_select);
+    ESPUI.addControl(Max, "", "50", None, duration_select);
+
     Readuserdetails();
     user_text = ESPUI.addControl(Text, "User name", stored_user, Alizarin, tab2, textCallback); // stored_user
     ESPUI.addControl(Max, "", "32", None, user_text);
@@ -288,32 +349,93 @@ void setup()
 
     ESPUI.begin("- Accces Control", stored_user.c_str(), stored_password.c_str()); //"espboard", 
 
-    digitalWrite(out1Pin, HIGH);
-    digitalWrite(out2Pin, LOW);
+    //Status update
+    ESPUI.getControl(status)->value = "Total open: " + String(total_open) + "\nTotal pass: " + String(total_pass);
+    ESPUI.updateControl(status);
 
+
+    digitalWrite(out1Pin, LOW);
+    digitalWrite(out2Pin, LOW);
+    random_access();
 }
 
 // Add the main program code into the continuous loop() function
 void loop()
 {
     dnsServer.processNextRequest();
+    esp32FOTA.handle();
+    
+    //check if IN_BUTTON pin gets LOW
+    if (digitalRead(IN_BUTTON) == LOW) {
+        //delay 100ms to debounce
+        delay(80); if (digitalRead(IN_BUTTON) == LOW) {
+            //increment the pass_count
+            pass_count++; total_pass++;
+            if (pass_count > 100)
+            {
+                pass_count = 1;
+                random_access();
+            }
+            //Check if the pass_count is in the rundom_numpers array
+            // if it is, open the door
+            // if not, do nothing
+            for (int i = 0; i < percent; i++) {
+                if (pass_count == rundom_numpers[i]) {
+                    total_open++;
+                    //open the door
+                    digitalWrite(out1Pin, HIGH);
+                    digitalWrite(out2Pin, HIGH);
+                    delay(duration * 1000);
+                    digitalWrite(out1Pin, LOW);
+                    digitalWrite(out2Pin, LOW);
+                    break;
+                }
+            }
+            //Status update
+            ESPUI.getControl(status)->value = "Total open: " + String(total_open) + "\nTotal pass: " + String(total_pass);
+            ESPUI.updateControl(status);
+            //loop while button is pressed
+            while (digitalRead(IN_BUTTON) == LOW) {
+                delay(50);
+            }
+            delay(10);
+        }
+    }
 
-    // read the state of the pushbutton value
-    buttonState = digitalRead(buttonPin);
-    //Serial.println(buttonState);
-    // check if the pushbutton is pressed.
-    // if it is, the buttonState is HIGH
-    if (buttonState == HIGH) {
-        // turn LED on
-        digitalWrite(ledPin, HIGH);
-        digitalWrite(out1Pin, LOW);
-        digitalWrite(out2Pin, HIGH);
+    //flash the LED ledPin every 1000ms
+    if (millis() - led_timeout > 500) {
+		led_timeout = millis();
+		//toggle the LED
+        digitalWrite(ledPin, !digitalRead(ledPin));
+	}
+}
+
+// Make a funcion to choose random numbers while the pass_count it counts until 100 depending on the percent_select
+void random_access(void) {
+	// clear the rundom_numpers array
+    for (int i = 0; i < percent; i++) {
+		rundom_numpers[i] = 0;
+	}    
+    // find rundom unique numbers as many as the percent_select and store them in the rundom_numpers array
+    for (int i = 0; i < percent; i++) {
+		int temp = random(1, 100);
+		for (int j = 0; j < i; j++) {
+			if (temp == rundom_numpers[j]) {
+				temp = random(1, 100);
+				j = -1;
+			}
+		}
+		rundom_numpers[i] = temp;
+	}
+
+    // print the rundom_numpers array
+    Serial.println();
+    Serial.println("The new rundom_numpers");
+    for (int i = 0; i < percent; i++) {
+        Serial.print(rundom_numpers[i]);
+        Serial.print(" ");        
     }
-    else {
-        // turn LED off
-        digitalWrite(ledPin, LOW);
-        digitalWrite(out1Pin, HIGH);
-        digitalWrite(out2Pin, LOW);
-    }
-    delay(100);
+    
+    Serial.println();
+    Serial.println("-----------------------------");
 }
